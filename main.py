@@ -1,10 +1,16 @@
 import os
-from fastapi import FastAPI, HTTPException
+import re
+import tempfile
+from typing import Iterator
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from typing import List
 
 from database import create_document, get_documents, db
+
+# Import yt_dlp lazily inside endpoint to keep startup fast
 
 app = FastAPI()
 
@@ -87,7 +93,6 @@ def get_leaderboard(limit: int = 20):
     try:
         # Higher points first, then shorter duration
         docs = get_documents("score", {})
-        # Sort in Python in case Mongo sort isn't used in helper
         docs_sorted = sorted(
             docs,
             key=lambda d: (-int(d.get("points", 0)), int(d.get("duration_ms", 1_000_000)))
@@ -102,6 +107,81 @@ def get_leaderboard(limit: int = 20):
             for d in docs_sorted[:limit]
         ]
         return {"ok": True, "items": top}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ----- YouTube download endpoint (for content you own or have permission to download) -----
+YOUTUBE_URL_RE = re.compile(r"^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+", re.IGNORECASE)
+
+
+@app.get("/api/download")
+async def download_youtube(url: str = Query(..., description="YouTube video URL")):
+    # Basic validation
+    if not YOUTUBE_URL_RE.match(url):
+        raise HTTPException(status_code=400, detail="Please provide a valid YouTube URL")
+
+    # Import yt_dlp lazily
+    try:
+        import yt_dlp  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Downloader unavailable: {e}")
+
+    tmpdir = tempfile.mkdtemp(prefix="yt_")
+
+    # We'll try to get best MP4 if possible, otherwise best available
+    ydl_opts = {
+        "quiet": True,
+        "noprogress": True,
+        "outtmpl": os.path.join(tmpdir, "%(title).200B.%(ext)s"),
+        "restrictfilenames": True,
+        "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b/bestaudio+bv*",
+        "merge_output_format": "mp4",
+    }
+
+    filename_holder = {"path": None}
+
+    def run_download() -> str:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filepath = ydl.prepare_filename(info)
+            # If post-processing merged to mp4, adjust extension
+            if info.get("ext") != "mp4" and os.path.exists(filepath.rsplit(".", 1)[0] + ".mp4"):
+                filepath = filepath.rsplit(".", 1)[0] + ".mp4"
+            return filepath
+
+    try:
+        filepath = run_download()
+        if not os.path.exists(filepath):
+            raise HTTPException(status_code=500, detail="Failed to download video")
+        filename = os.path.basename(filepath)
+
+        def file_iterator(path: str) -> Iterator[bytes]:
+            try:
+                with open(path, "rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                # Cleanup
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                try:
+                    os.rmdir(tmpdir)
+                except Exception:
+                    pass
+
+        headers = {
+            "Content-Disposition": f"attachment; filename=\"{filename}\""
+        }
+        return StreamingResponse(file_iterator(filepath), media_type="video/mp4", headers=headers)
+
+    except yt_dlp.utils.DownloadError as e:  # type: ignore
+        raise HTTPException(status_code=400, detail=f"Download error: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
