@@ -38,11 +38,13 @@ class Product(BaseModel):
     category: str = Field(..., description="Product category")
     in_stock: bool = Field(True, description="Whether product is in stock")
 
-# Add your own schemas here:
-# --------------------------------------------------
-
-# Note: The Flames database viewer will automatically:
-# 1. Read these schemas from GET /schema endpoint
-# 2. Use them for document validation when creating/editing
-# 3. Handle all database operations (CRUD) directly
-# 4. You don't need to create any database endpoints!
+# Game-specific schemas
+class Score(BaseModel):
+    """
+    Scores collection schema
+    Collection name: "score"
+    """
+    name: str = Field(..., min_length=1, max_length=20, description="Player name")
+    points: int = Field(..., ge=0, description="Score points")
+    level: int = Field(1, ge=1, description="Level reached")
+    duration_ms: int = Field(..., ge=0, description="How long the run took in ms")
